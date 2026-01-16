@@ -1,0 +1,42 @@
+{
+  "input": "yolo26n_npu.onnx",
+  "output_dir": "./",
+  "output_name": "yolo26n_npu3.axmodel",
+  "model_type": "ONNX",
+  "npu_mode": "NPU3",
+  "quant": {
+    "input_configs": [
+      {
+        "tensor_name": "images",
+        "calibration_dataset": "./coco_1000.tar",
+        "calibration_size": 32,
+        "calibration_mean": [
+          0,
+          0,
+          0
+        ],
+        "calibration_std": [
+          255.0,
+          255.0,
+          255.0
+        ]
+      }
+    ],
+    "calibration_method": "MinMax",
+    "precision_analysis": true,
+    "precision_analysis_method": "EndToEnd"
+  },
+  "input_processors": [
+    {
+      "tensor_name": "images",
+      "tensor_format": "BGR",
+      "src_format": "BGR",
+      "src_dtype": "U8",
+      "src_layout": "NHWC"
+    }
+  ],
+  "output_processors": [],
+  "compiler": {
+    "check": 0
+  }
+}
