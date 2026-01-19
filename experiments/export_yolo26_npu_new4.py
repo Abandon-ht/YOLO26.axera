@@ -33,7 +33,7 @@ GRID_S16 = _make_grid_flat(40, 40)   # [1600,2]
 GRID_S32 = _make_grid_flat(20, 20)   # [400,2]
 STRIDES = [8.0, 16.0, 32.0]
 
-def npu_detect_forward_global_topk(self, x):
+def npu_detect_forward_global_topk_legacy(self, x):
     """
     Return:
       det: [B, TOPK, 6] float32
@@ -114,6 +114,87 @@ def npu_detect_forward_global_topk(self, x):
 
     return det
 
+def npu_detect_forward_global_topk(self, x):
+    """
+    Return:
+      det: [B, TOPK, 6] float32
+           (x1,y1,x2,y2,score,class_id_float)
+
+    Notes:
+      - no Mod/Div needed (grid is constant + broadcast)
+      - global TopK across all scales (8400 candidates -> TopK)
+      - class_id is kept as float32 to avoid int32/int16 concat issues in quant export
+    """
+    # choose one2one branch if exists
+    if hasattr(self, 'one2one_cv2') and hasattr(self, 'one2one_cv3'):
+        box_layers = self.one2one_cv2
+        cls_layers = self.one2one_cv3
+    else:
+        box_layers = self.cv2
+        cls_layers = self.cv3
+
+    grid_flats = [GRID_S8, GRID_S16, GRID_S32]
+    xyxy_list, score_list, id_list = [], [], []
+
+    for i in range(self.nl):
+        stride = float(STRIDES[i])
+        grid_flat = grid_flats[i].to(x[i].device)  # [HW,2]
+
+        # box: [B,4,H,W] -> [B,H,W,4]
+        box = box_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
+        # cls logits: [B,C,H,W] -> [B,H,W,C]
+        cls_logits = cls_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
+
+        # per-cell best class: ReduceMax + Sigmoid (score), ArgMax (id)
+        max_logit = torch.amax(cls_logits, dim=-1, keepdim=True)     # [B,H,W,1]
+        score = torch.sigmoid(max_logit)                              # [B,H,W,1]
+
+        # IMPORTANT: keep class id as float to avoid int dtype concat/quant issues
+        cls_id = torch.argmax(cls_logits, dim=-1, keepdim=True).to(torch.float32)  # [B,H,W,1]
+
+        B, H, W, _ = box.shape
+        HW = H * W
+
+        # flatten
+        box_f = box.view(B, HW, 4)          # [B,HW,4]
+        score_f = score.view(B, HW)         # [B,HW]
+        id_f = cls_id.view(B, HW)           # [B,HW] float32
+
+        # grid: [HW,2] -> [B,HW,2]
+        grid = grid_flat.unsqueeze(0).expand(B, -1, -1) + 0.5        # [B,HW,2]
+
+        # decode xyxy (pixel coords in padded input)
+        xy1 = grid - box_f[..., :2]
+        xy2 = grid + box_f[..., 2:]
+        xyxy = torch.cat([xy1, xy2], dim=-1) * stride                # [B,HW,4]
+
+        xyxy_list.append(xyxy)
+        score_list.append(score_f)
+        id_list.append(id_f)
+
+    # concat all scales: N = 6400+1600+400 = 8400
+    xyxy_all = torch.cat(xyxy_list, dim=1)      # [B,N,4]
+    score_all = torch.cat(score_list, dim=1)    # [B,N]
+    id_all = torch.cat(id_list, dim=1)          # [B,N] float32
+
+    # global TopK on score
+    N = score_all.shape[1]
+    k = min(TOPK, N)
+    topv, topi = torch.topk(score_all, k=k, dim=1, largest=True, sorted=True)  # topi: [B,K] (int64 in torch/onnx)
+
+    # gather xyxy/id by indices
+    idx_xyxy = topi.unsqueeze(-1).expand(-1, -1, 4)                           # [B,K,4]
+    xyxy_topk = torch.gather(xyxy_all, dim=1, index=idx_xyxy)                 # [B,K,4]
+    id_topk = torch.gather(id_all, dim=1, index=topi)                         # [B,K] float32
+
+    # merge to [B,K,6] float32
+    det = torch.cat([
+        xyxy_topk.to(torch.float32),
+        topv.unsqueeze(-1).to(torch.float32),
+        id_topk.unsqueeze(-1).to(torch.float32),
+    ], dim=-1)
+
+    return det
 
 def export_npu_onnx(model_path, output_name="yolo26_global_topk.onnx", imgsz=640):
     print(f"Loading model: {model_path}...")
