@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# YOLO26 Export ONNX model Script (TopK+Gather+Decode)
+# ==============================================================================
+# 1. Add ReduceMax/ArgMax/Sigmoid
+# ==============================================================================
+# 2. Add TopK/Gather
+# ==============================================================================
 import os
 import shutil
 import torch

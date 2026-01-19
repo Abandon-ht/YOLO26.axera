@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-# YOLO26 Export ONNX (No Mod, Global TopK, Single output [1,300,6], avoid expand/repeat shape-concat)
+# ==============================================================================
+# 1. Add ReduceMax/ArgMax/Sigmoid
+# ==============================================================================
+# 2. Add TopK/Gather
+# ==============================================================================
+# 3. Remove Mod
+# ==============================================================================
+# 4. Concat all scales, Global TopK
+# ==============================================================================
+'''
+yasched.exceptions.TileFailException: AxTopK, tuple index out of range
+    op: /model.23/TopK
+    attrs: {'const_inputs': {}, 'k': 300, 'dim': 0, 'largest': 1, 'sorted': 1}
+    inputs: {'x': Tensor(U8, name=/model.23/Squeeze_1_output_0, shape=(8400,), offset=0, bit_strides=(8,)}
+    mem_limit: MemLimit(workspace=524288, max_mem_size=11521840)
+'''
 import os
 import shutil
 import numpy as np
@@ -16,22 +31,22 @@ def _make_grid_flat(H, W):
     grid = np.stack([gu, gv], axis=-1).reshape(-1, 2)  # [HW,2]
     return torch.from_numpy(grid)  # float32
 
-# fixed grids for 640
-GRID_S8  = _make_grid_flat(80, 80)   # 6400x2
-GRID_S16 = _make_grid_flat(40, 40)   # 1600x2
-GRID_S32 = _make_grid_flat(20, 20)   # 400x2
+# 固定输入 640 -> 固定网格
+GRID_S8  = _make_grid_flat(80, 80)   # [6400,2]
+GRID_S16 = _make_grid_flat(40, 40)   # [1600,2]
+GRID_S32 = _make_grid_flat(20, 20)   # [400,2]
 STRIDES = [8.0, 16.0, 32.0]
 
-def npu_detect_forward_global_topk_single(self, x):
+def npu_detect_forward_global_topk(self, x):
     """
-    Output:
-      det: [1, TOPK, 6] float32
-           [x1,y1,x2,y2,score,class_id_float]
+    Return:
+      det: [B, TOPK, 6] float32
+           (x1,y1,x2,y2,score,class_id_float)
     Notes:
-      - no Mod/Div
-      - no expand/repeat for gather indices (avoid shape Concat dtype issue)
-      - assumes batch=1 (dynamic=False export)
+      - no Mod/Div needed (grid is constant + broadcast)
+      - global TopK across all scales (8400 candidates -> Top300)
     """
+    # 选择 one2one 分支（如果存在）
     if hasattr(self, 'one2one_cv2') and hasattr(self, 'one2one_cv3'):
         box_layers = self.one2one_cv2
         cls_layers = self.one2one_cv3
@@ -49,66 +64,67 @@ def npu_detect_forward_global_topk_single(self, x):
         stride = float(STRIDES[i])
         grid_flat = grid_flats[i].to(x[i].device)  # [HW,2]
 
-        # box: [1,4,H,W] -> [1,H,W,4]
+        # box: [B,4,H,W] -> [B,H,W,4]
         box = box_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
-        # cls: [1,80,H,W] -> [1,H,W,80]
+        # cls logits: [B,80,H,W] -> [B,H,W,80]
         cls_logits = cls_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
 
-        # best class per cell
-        max_logit = torch.amax(cls_logits, dim=-1, keepdim=True)               # [1,H,W,1]
-        score = torch.sigmoid(max_logit)                                       # [1,H,W,1]
-        cls_id = torch.argmax(cls_logits, dim=-1, keepdim=True).to(torch.int32)  # [1,H,W,1]
+        # per-cell best (ReduceMax/ArgMax/Sigmoid)
+        max_logit = torch.amax(cls_logits, dim=-1, keepdim=True)              # [B,H,W,1]
+        score = torch.sigmoid(max_logit)                                       # [B,H,W,1]
+        cls_id = torch.argmax(cls_logits, dim=-1, keepdim=True).to(torch.int32) # [B,H,W,1]
 
-        # known fixed shapes (batch=1, H/W fixed)
-        _, H, W, _ = box.shape
+        B, H, W, _ = box.shape
         HW = H * W
 
-        box_f = box.reshape(1, HW, 4)         # [1,HW,4]
-        score_f = score.reshape(1, HW)        # [1,HW]
-        id_f = cls_id.reshape(1, HW)          # [1,HW]
+        # flatten
+        box_f = box.view(B, HW, 4)          # [B,HW,4]
+        score_f = score.view(B, HW)         # [B,HW]
+        id_f = cls_id.view(B, HW)           # [B,HW]
 
-        # grid: [HW,2] -> [1,HW,2]
-        grid = grid_flat.reshape(1, HW, 2) + 0.5
+        # grid: [HW,2] -> [B,HW,2]
+        grid = grid_flat.unsqueeze(0).expand(B, -1, -1) + 0.5                 # [B,HW,2]
 
-        # decode
+        # decode xyxy (pixel coords in padded input)
         xy1 = grid - box_f[..., :2]
         xy2 = grid + box_f[..., 2:]
-        xyxy = torch.cat([xy1, xy2], dim=-1) * stride   # [1,HW,4]
+        xyxy = torch.cat([xy1, xy2], dim=-1) * stride                         # [B,HW,4]
 
         xyxy_list.append(xyxy)
         score_list.append(score_f)
         id_list.append(id_f)
 
-    # concat scales: [1,8400,4], [1,8400], [1,8400]
-    xyxy_all = torch.cat(xyxy_list, dim=1)
-    score_all = torch.cat(score_list, dim=1)
-    id_all = torch.cat(id_list, dim=1)
+    # concat all scales: N = 6400+1600+400 = 8400
+    xyxy_all = torch.cat(xyxy_list, dim=1)           # [B,N,4]
+    score_all = torch.cat(score_list, dim=1)         # [B,N]
+    id_all = torch.cat(id_list, dim=1)               # [B,N]
 
-    # squeeze batch -> do global topk on 1D (avoid batch-wise gather index expand)
-    xyxy0 = xyxy_all.squeeze(0)    # [N,4]
-    score0 = score_all.squeeze(0)  # [N]
-    id0 = id_all.squeeze(0)        # [N]
+    # global TopK on score
+    N = score_all.shape[1]
+    k = min(TOPK, N)
+    topv, topi = torch.topk(score_all, k=k, dim=1, largest=True, sorted=True)  # topi: [B,K]
 
-    topv, topi = torch.topk(score0, k=TOPK, dim=0, largest=True, sorted=True)  # topi: [K] int64
+    # gather xyxy/id by indices
+    idx_xyxy = topi.unsqueeze(-1).expand(-1, -1, 4)     # [B,K,4]
+    xyxy_topk = torch.gather(xyxy_all, dim=1, index=idx_xyxy)  # [B,K,4]
+    id_topk = torch.gather(id_all, dim=1, index=topi)          # [B,K]
 
-    xyxy_topk = torch.index_select(xyxy0, dim=0, index=topi)  # [K,4]
-    id_topk = torch.index_select(id0, dim=0, index=topi)      # [K]
-
-    det0 = torch.cat([
+    # merge to [B,K,6] float32 (class_id cast to float32)
+    det = torch.cat([
         xyxy_topk.to(torch.float32),
         topv.unsqueeze(-1).to(torch.float32),
-        id_topk.to(torch.float32).unsqueeze(-1),
-    ], dim=-1)  # [K,6]
+        id_topk.unsqueeze(-1).to(torch.float32),
+    ], dim=-1)
 
-    return det0.unsqueeze(0)  # [1,K,6]
+    return det
 
 
-def export_npu_onnx(model_path, output_name="yolo26_global_topk_1x300x6.onnx", imgsz=640):
+def export_npu_onnx(model_path, output_name="yolo26_global_topk.onnx", imgsz=640):
     print(f"Loading model: {model_path}...")
     model = YOLO(model_path)
 
-    Detect.forward = npu_detect_forward_global_topk_single
-    print(f"Exporting: Global TopK={TOPK}, output [1,{TOPK},6], no Mod, avoid expand/repeat...")
+    Detect.forward = npu_detect_forward_global_topk
+    print(f"Monkey patch applied (Global TopK={TOPK}, merged output [1,{TOPK},6], no Mod). Exporting...")
 
     exported_path = model.export(
         format="onnx",
@@ -134,4 +150,4 @@ def export_npu_onnx(model_path, output_name="yolo26_global_topk_1x300x6.onnx", i
 
 
 if __name__ == "__main__":
-    export_npu_onnx("yolo26n.pt", "yolo26n_global_topk_1x300x6.onnx", imgsz=IMG_SIZE)
+    export_npu_onnx("yolo26n.pt", "yolo26n_global_topk.onnx", imgsz=IMG_SIZE)

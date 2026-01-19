@@ -1,78 +1,148 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# 1. Add ReduceMax/ArgMax/Sigmoid
+# ==============================================================================
+# 2. Add TopK/Gather
+# ==============================================================================
+# 3. Remove Mod
+# ==============================================================================
+# 4. Concat all scales, Global TopK
+# ==============================================================================
+'''
+AssertionError: /model.23/Concat_5_output_0 But var.dtype = <DataType.INT16: 5> vs expect_type = <DataType.INT32: 6>
+'''
+import os
+import shutil
 import numpy as np
 import torch
 from ultralytics import YOLO
 from ultralytics.nn.modules import Detect
-import shutil
 
-K_PER_SCALE = 200
 TOPK = 300
+IMG_SIZE = 640
 
 def _make_grid_flat(H, W):
     gu, gv = np.meshgrid(np.arange(W, dtype=np.float32),
                          np.arange(H, dtype=np.float32))
-    return torch.from_numpy(np.stack([gu, gv], axis=-1).reshape(-1, 2))
+    grid = np.stack([gu, gv], axis=-1).reshape(-1, 2)  # [HW,2]
+    return torch.from_numpy(grid)  # float32
 
-GRID_S8  = _make_grid_flat(80, 80)
-GRID_S16 = _make_grid_flat(40, 40)
-GRID_S32 = _make_grid_flat(20, 20)
+# fixed grids for 640
+GRID_S8  = _make_grid_flat(80, 80)   # 6400x2
+GRID_S16 = _make_grid_flat(40, 40)   # 1600x2
+GRID_S32 = _make_grid_flat(20, 20)   # 400x2
 STRIDES = [8.0, 16.0, 32.0]
 
-def forward_twostage_topk(self, x):
+def npu_detect_forward_global_topk_single(self, x):
+    """
+    Output:
+      det: [1, TOPK, 6] float32
+           [x1,y1,x2,y2,score,class_id_float]
+    Notes:
+      - no Mod/Div
+      - no expand/repeat for gather indices (avoid shape Concat dtype issue)
+      - assumes batch=1 (dynamic=False export)
+    """
     if hasattr(self, 'one2one_cv2') and hasattr(self, 'one2one_cv3'):
-        box_layers, cls_layers = self.one2one_cv2, self.one2one_cv3
+        box_layers = self.one2one_cv2
+        cls_layers = self.one2one_cv3
     else:
-        box_layers, cls_layers = self.cv2, self.cv3
+        box_layers = self.cv2
+        cls_layers = self.cv3
 
-    grids = [GRID_S8, GRID_S16, GRID_S32]
+    grid_flats = [GRID_S8, GRID_S16, GRID_S32]
 
-    dets = []  # each: [1,Ki,6]
+    xyxy_list = []
+    score_list = []
+    id_list = []
 
     for i in range(self.nl):
         stride = float(STRIDES[i])
-        grid_flat = grids[i].to(x[i].device)
+        grid_flat = grid_flats[i].to(x[i].device)  # [HW,2]
 
+        # box: [1,4,H,W] -> [1,H,W,4]
         box = box_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
-        cls = cls_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
+        # cls: [1,80,H,W] -> [1,H,W,80]
+        cls_logits = cls_layers[i](x[i]).permute(0, 2, 3, 1).contiguous()
 
-        max_logit = torch.amax(cls, dim=-1, keepdim=True)
-        score = torch.sigmoid(max_logit).reshape(1, -1)                # [1,HW]
-        cid = torch.argmax(cls, dim=-1).to(torch.int32).reshape(1, -1) # [1,HW]
+        # best class per cell
+        max_logit = torch.amax(cls_logits, dim=-1, keepdim=True)               # [1,H,W,1]
+        score = torch.sigmoid(max_logit)                                       # [1,H,W,1]
+        cls_id = torch.argmax(cls_logits, dim=-1, keepdim=True).to(torch.int32)  # [1,H,W,1]
 
+        # known fixed shapes (batch=1, H/W fixed)
         _, H, W, _ = box.shape
         HW = H * W
-        box_f = box.reshape(1, HW, 4)
+
+        box_f = box.reshape(1, HW, 4)         # [1,HW,4]
+        score_f = score.reshape(1, HW)        # [1,HW]
+        id_f = cls_id.reshape(1, HW)          # [1,HW]
+
+        # grid: [HW,2] -> [1,HW,2]
         grid = grid_flat.reshape(1, HW, 2) + 0.5
-        xyxy = torch.cat([grid - box_f[..., :2], grid + box_f[..., 2:]], dim=-1) * stride  # [1,HW,4]
 
-        k1 = min(K_PER_SCALE, HW)
-        v1, i1 = torch.topk(score, k=k1, dim=1, largest=True, sorted=True)  # [1,k1]
+        # decode
+        xy1 = grid - box_f[..., :2]
+        xy2 = grid + box_f[..., 2:]
+        xyxy = torch.cat([xy1, xy2], dim=-1) * stride   # [1,HW,4]
 
-        x1 = torch.gather(xyxy[..., 0], 1, i1)
-        y1 = torch.gather(xyxy[..., 1], 1, i1)
-        x2 = torch.gather(xyxy[..., 2], 1, i1)
-        y2 = torch.gather(xyxy[..., 3], 1, i1)
-        xyxy_1 = torch.stack([x1, y1, x2, y2], dim=-1)  # [1,k1,4]
-        cid_1 = torch.gather(cid, 1, i1).to(torch.float32).unsqueeze(-1)
-        v1 = v1.to(torch.float32).unsqueeze(-1)
+        xyxy_list.append(xyxy)
+        score_list.append(score_f)
+        id_list.append(id_f)
 
-        dets.append(torch.cat([xyxy_1.to(torch.float32), v1, cid_1], dim=-1))  # [1,k1,6]
+    # concat scales: [1,8400,4], [1,8400], [1,8400]
+    xyxy_all = torch.cat(xyxy_list, dim=1)
+    score_all = torch.cat(score_list, dim=1)
+    id_all = torch.cat(id_list, dim=1)
 
-    det_all = torch.cat(dets, dim=1)         # [1, 3*k1, 6]
-    score_all = det_all[..., 4]              # [1, 3*k1]
+    # squeeze batch -> do global topk on 1D (avoid batch-wise gather index expand)
+    xyxy0 = xyxy_all.squeeze(0)    # [N,4]
+    score0 = score_all.squeeze(0)  # [N]
+    id0 = id_all.squeeze(0)        # [N]
 
-    v2, i2 = torch.topk(score_all, k=min(TOPK, score_all.shape[1]), dim=1, largest=True, sorted=True)
+    topv, topi = torch.topk(score0, k=TOPK, dim=0, largest=True, sorted=True)  # topi: [K] int64
 
-    # gather final det_all by i2 (again avoid expand: gather each column)
-    cols = [torch.gather(det_all[..., j], 1, i2) for j in range(6)]
-    det = torch.stack(cols, dim=-1)          # [1,TOPK,6]
-    return det
+    xyxy_topk = torch.index_select(xyxy0, dim=0, index=topi)  # [K,4]
+    id_topk = torch.index_select(id0, dim=0, index=topi)      # [K]
 
-def export(model_path, output_name):
-    y = YOLO(model_path)
-    Detect.forward = forward_twostage_topk
-    p = y.export(format="onnx", imgsz=640, dynamic=False, opset=11, simplify=True)
-    if p and output_name:
-        shutil.move(p, output_name)
-    return output_name
+    det0 = torch.cat([
+        xyxy_topk.to(torch.float32),
+        topv.unsqueeze(-1).to(torch.float32),
+        id_topk.to(torch.float32).unsqueeze(-1),
+    ], dim=-1)  # [K,6]
 
-export("yolo26n.pt", "yolo26_fuck.onnx")
+    return det0.unsqueeze(0)  # [1,K,6]
+
+
+def export_npu_onnx(model_path, output_name="yolo26_global_topk_1x300x6.onnx", imgsz=640):
+    print(f"Loading model: {model_path}...")
+    model = YOLO(model_path)
+
+    Detect.forward = npu_detect_forward_global_topk_single
+    print(f"Exporting: Global TopK={TOPK}, output [1,{TOPK},6], no Mod, avoid expand/repeat...")
+
+    exported_path = model.export(
+        format="onnx",
+        imgsz=imgsz,
+        dynamic=False,
+        opset=11,
+        simplify=True
+    )
+
+    if exported_path:
+        print(f"✅ Export success: {exported_path}")
+        if output_name:
+            out_dir = os.path.dirname(output_name)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+            shutil.move(exported_path, output_name)
+            print(f"Renamed to: {output_name}")
+            return output_name
+        return exported_path
+
+    print("❌ Export failed.")
+    return None
+
+
+if __name__ == "__main__":
+    export_npu_onnx("yolo26n.pt", "yolo26n_global_topk_1x300x6.onnx", imgsz=IMG_SIZE)

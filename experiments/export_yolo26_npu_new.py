@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# YOLO26 Export ONNX model Script
+# ==============================================================================
+# 1. Add ReduceMax/ArgMax/Sigmoid
+# ==============================================================================
 import torch
 from ultralytics import YOLO
 from ultralytics.nn.modules import Detect
