@@ -9,11 +9,7 @@
 # 4. Concat all scales, Global TopK
 # ==============================================================================
 '''
-yasched.exceptions.TileFailException: AxTopK, tuple index out of range
-    op: /model.23/TopK
-    attrs: {'const_inputs': {}, 'k': 300, 'dim': 0, 'largest': 1, 'sorted': 1}
-    inputs: {'x': Tensor(U8, name=/model.23/Squeeze_1_output_0, shape=(8400,), offset=0, bit_strides=(8,)}
-    mem_limit: MemLimit(workspace=524288, max_mem_size=11521840)
+AssertionError: /model.23/Concat_5_output_0 But var.dtype = <DataType.INT16: 5> vs expect_type = <DataType.INT32: 6>
 '''
 import os
 import shutil
