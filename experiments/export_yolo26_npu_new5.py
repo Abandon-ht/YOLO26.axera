@@ -92,4 +92,5 @@ def export(model_path, output_name):
         shutil.move(p, output_name)
     return output_name
 
-export("yolo26n.pt", "yolo26_global_topk_fix2d.onnx")
+if __name__ == "__main__":
+    export("yolo26n.pt", "yolo26n_global_topk_fix.onnx")

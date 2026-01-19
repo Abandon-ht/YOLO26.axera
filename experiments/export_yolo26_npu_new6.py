@@ -145,4 +145,4 @@ def export_npu_onnx(model_path, output_name="yolo26_global_topk_1x300x6.onnx", i
 
 
 if __name__ == "__main__":
-    export_npu_onnx("yolo26n.pt", "yolo26n_global_topk_1x300x6.onnx", imgsz=IMG_SIZE)
+    export_npu_onnx("yolo26n.pt", "yolo26n_global_topk_fix2.onnx", imgsz=IMG_SIZE)
